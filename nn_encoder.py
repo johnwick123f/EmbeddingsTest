@@ -5,6 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from scipy.cluster.vq import kmeans2
+from quantizer import UniformQuantizer
 
 # --- Official ConvNeXt V2 Component Integrations ---
 
