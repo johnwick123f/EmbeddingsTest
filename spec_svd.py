@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from typing import Union
 from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
 
 def l2_normalize_rows(x: Union[np.ndarray, torch.Tensor], eps: float = 1e-12) -> Union[np.ndarray, torch.Tensor]:
     """L2 normalize each row. Supports both numpy arrays and torch tensors."""
@@ -142,7 +143,7 @@ class SpectralTemperingWhitener:
 
         # Early text cropping to 1000 items to completely skip heavy encoding overhead
         np.random.seed(seed)
-        if len(doc_texts) > 1000:
+        if len(doc_texts) > 20000:
             crop_indices = np.random.choice(
                 len(doc_texts), 1000, replace=False
             )
@@ -254,122 +255,91 @@ class SpectralTemperingWhitener:
         return transformed_queries, transformed_docs
 
 
-class WhiteningKTruncationWhitener:
-
+class QuantizedWhitenerSpec(SpectralTemperingWhitener):
     def __init__(
         self,
-        model: SentenceTransformer,
+        model, # SentenceTransformer
         data_folder: str,
-        target_dim: int = 512,
-        beta: float = 1.0,
-        gamma: float = 1.0,
+        target_dim: int = 256,
+        gamma: float = 0.05,
+        auto_gamma: bool = True,
+        kneedle_S: float = 0.5,
+        epsilon: float = 1e-6,
         seed: int = 2026,
-        data_loader_class=None,  # Pass GenericDataLoader here
+        data_loader_class=None,
     ):
-        """Initializes the whitener by loading data, early text cropping to 1,000 documents,
-
-        encoding them, and computing the static target dim kernel projection.
-        """
-        if data_loader_class is None:
-            raise ValueError(
-                "Please pass the 'GenericDataLoader' class reference to 'data_loader_class'."
-            )
-
-        print(f"Loading dataset from: {data_folder}...")
-        corpus, queries, _ = data_loader_class(data_folder).load(split="test")
-
-        # Extract raw texts
-        doc_texts = [
-            f"{corpus[did].get('title', '')} {corpus[did].get('text', '')}".strip()
-            for did in corpus.keys()
-        ]
-
-        # Early text cropping to 1000 items to completely bypass heavy encoding overhead
-        np.random.seed(seed)
-        if len(doc_texts) > 1000:
-            crop_indices = np.random.choice(
-                len(doc_texts), 1000, replace=False
-            )
-            doc_texts = [doc_texts[idx] for idx in crop_indices]
-
-        print(f"Encoding {len(doc_texts)} calibration documents...")
-        document_embeddings = model.encode(
-            doc_texts,
-            batch_size=256,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=True,
+        # 1. Run the base Spectral Tempering SVD/Eigh training setup completely
+        super().__init__(
+            model=model,
+            data_folder=data_folder,
+            target_dim=target_dim,
+            gamma=gamma,
+            auto_gamma=auto_gamma,
+            kneedle_S=kneedle_S,
+            epsilon=epsilon,
+            seed=seed,
+            data_loader_class=data_loader_class
         )
 
-        n_dim = document_embeddings.shape[1]
+        # 2. Assign configuration variables and compose the quantizer
+        self.target_dim = target_dim
+        self.quantizer = UniformQuantizer()
 
-        # 1. Process sample data (float64 for numerical precision)
-        sample_data = document_embeddings.astype(np.float64)
+        print("[*] QuantizedWhitenerSpec uniform scalar initialization completed.")
 
-        # Compute mean scaled by beta to control degree of mean subtraction
-        self.sample_mean = np.mean(sample_data, axis=0) * beta
+    def _validate_quantization_params(self, target_dim: int, bits: int):
+        if bits not in [1, 2, 3, 4, 5, 8]:
+            raise ValueError("Supported bit widths are 1, 2, 3, 4, or 5 to remain byte-aligned.")
 
-        # Compute covariance matrix (np.cov auto-centers)
-        print("[*] Computing covariance and eigenvalue decomposition...")
-        cov = np.cov(sample_data.T)
-        del sample_data
+        if (target_dim * bits) % 8 != 0:
+            raise ValueError(
+                f"target_dim ({target_dim}) with {bits}-bit quantization "
+                f"results in a fractional byte row length ({ (target_dim * bits) / 8 }). "
+                f"Please ensure (target_dim * bits) is a multiple of 8."
+            )
 
-        # 2. Eigenvalue decomposition
-        L, U = np.linalg.eigh(cov)
-        del cov
-
-        # Sort in descending order
-        idx = np.argsort(L)[::-1]
-        L = L[idx]
-        U = U[:, idx]
-
-        # Take first target_dim principal components and build static whitening kernel
-        L = L[:target_dim]
-        U = U[:, :target_dim]
-        eps = 1e-6
-        self.kernel = U * ((L + eps) ** (-(gamma / 2.0)))
-        print(f"[*] Whitening Kernel Matrix Formed: {n_dim} -> {target_dim}")
-
-    def whitening_k_truncation(
+    def compress_embeddings(
         self,
         query_embeddings: np.ndarray,
         document_embeddings: np.ndarray,
-        target_dim: int = 512,  # Kept in signature for matching format
-        sample_size: int = 1000000,  # Kept in signature for matching format
+        target_dim: int = 256,
+        bits: int = 2,
+        quantize: bool = True,
         batch_size: int = 100000,
-        seed: int = 2026,  # Kept in signature for matching format
-        beta: float = 1.0,  # Unused inside class execution (pre-calculated)
-        gamma: float = 1.0,  # Unused inside class execution (pre-calculated)
+        remove_mean: bool = True,
     ):
-        """Executes the standard Whitening-k transform over downstream targets using the
-
-        projection matrix and scaled mean pre-calculated during instantiation.
         """
+        Symmetric Variant: Maps incoming data arrays via self.P,
+        then applies uniform quantization to BOTH queries and documents.
+        """
+        if quantize:
+            self._validate_quantization_params(target_dim, bits)
+
         n_docs = document_embeddings.shape[0]
         n_queries = query_embeddings.shape[0]
 
-        # 3. Batch transform documents
-        transformed_docs_list = []
-        for i in tqdm(range(0, n_docs, batch_size), desc="Whitening transform docs"):
-            batch = document_embeddings[i : i + batch_size].astype(np.float64)
-            batch_centered = batch - self.sample_mean
-            batch_transformed = batch_centered @ self.kernel
-            batch_transformed = l2_normalize_rows(batch_transformed)
-            transformed_docs_list.append(batch_transformed.astype(np.float32))
-
-        transformed_document_embeddings = np.vstack(transformed_docs_list)
-
-        # 4. Batch transform queries
+        # 1. Transform Queries via SVD Matrix
         transformed_queries_list = []
-        for i in tqdm(
-            range(0, n_queries, batch_size), desc="Whitening transform queries"
-        ):
+        for i in range(0, n_queries, batch_size):
             batch = query_embeddings[i : i + batch_size].astype(np.float64)
-            batch_centered = batch - self.sample_mean
-            batch_transformed = batch_centered @ self.kernel
+            batch_transformed = np.dot(batch - self.sample_mean if remove_mean else batch, self.P)
             batch_transformed = l2_normalize_rows(batch_transformed)
             transformed_queries_list.append(batch_transformed.astype(np.float32))
+        transformed_queries = np.vstack(transformed_queries_list)
 
-        transformed_query_embeddings = np.vstack(transformed_queries_list)
+        # 2. Transform Documents via SVD Matrix
+        transformed_docs_list = []
+        for i in range(0, n_docs, batch_size):
+            batch = document_embeddings[i : i + batch_size].astype(np.float64)
+            batch_transformed = np.dot(batch - self.sample_mean if remove_mean else batch, self.P)
+            batch_transformed = l2_normalize_rows(batch_transformed)
+            transformed_docs_list.append(batch_transformed.astype(np.float32))
+        transformed_docs = np.vstack(transformed_docs_list)
 
-        return transformed_query_embeddings, transformed_document_embeddings
+        # 3. Apply uniform scalar quantization and packing via composition
+        if quantize:
+            quantized_queries = self.quantizer.quantize_and_pack(transformed_queries, bits=bits)
+            quantized_docs = self.quantizer.quantize_and_pack(transformed_docs, bits=bits)
+            return quantized_queries, quantized_docs
+        else:
+            return transformed_queries, transformed_docs
