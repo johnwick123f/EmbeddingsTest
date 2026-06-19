@@ -3,6 +3,7 @@ import torch
 from typing import Union
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
+from quantizer import UniformQuantizer
 
 def l2_normalize_rows(x: Union[np.ndarray, torch.Tensor], eps: float = 1e-12) -> Union[np.ndarray, torch.Tensor]:
     """L2 normalize each row. Supports both numpy arrays and torch tensors."""
